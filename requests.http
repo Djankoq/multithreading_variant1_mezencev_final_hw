@@ -1,0 +1,43 @@
+@base = http://localhost:8080
+
+### 1. Демонстрация без внешних сайтов; сохранение jobId для следующих запросов
+POST {{base}}/api/crawls/demo
+
+> {% client.global.set("jobId", response.body.id); %}
+
+### 2. Дождаться статуса COMPLETED
+GET {{base}}/api/crawls/{{jobId}}
+
+### 3. Результаты
+GET {{base}}/answer?jobId={{jobId}}&sort=type&direction=asc&size=100
+
+### 3a. Результаты из независимого JSON-файла после завершения задания
+GET {{base}}/api/crawls/{{jobId}}/file
+
+### 4. Фильтр email и пагинация
+GET {{base}}/answer?jobId={{jobId}}&type=EMAIL&query=vector&sort=value&direction=desc&page=0&size=2
+
+### 5. Посещённые страницы, ссылки и ошибки
+GET {{base}}/api/crawls/{{jobId}}/pages
+
+### 6. Собственное задание (замените URL при необходимости)
+POST {{base}}/api/crawls
+Content-Type: application/json
+
+{"startUrls":["http://localhost:8080/demo/company/"],"maxDepth":2,"maxPages":10}
+
+> {% client.global.set("jobId", response.body.id); %}
+
+### 7. Создать расписание
+POST {{base}}/api/schedules
+Content-Type: application/json
+
+{"crawl":{"startUrls":["http://localhost:8080/demo/company/"],"maxDepth":2,"maxPages":10},"intervalSeconds":30}
+
+> {% client.global.set("scheduleId", response.body.id); %}
+
+### 8. Расписания и lastJobId
+GET {{base}}/api/schedules
+
+### 9. Прекратить периодические запуски
+DELETE {{base}}/api/schedules/{{scheduleId}}

@@ -1,0 +1,31 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: contact-crawler
+  main:
+    web-application-type: servlet
+  datasource:
+    url: jdbc:h2:file:./data/contacts;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password: ""
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: update
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+crawler:
+  workers: 8
+  concurrent-jobs: 2
+  request-timeout-seconds: 10
+  max-body-bytes: 2097152
+  host-delay-millis: 200
+  scheduler-delay-millis: 5000
+  file-store:
+    directory: ./data/results
+  event-log:
+    path: ./data/logs/crawler-events.jsonl
+    queue-capacity: 1024

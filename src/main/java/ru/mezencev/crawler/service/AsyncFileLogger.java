@@ -9,6 +9,8 @@ import java.nio.file.*;
 import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.*;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -21,9 +23,10 @@ public class AsyncFileLogger implements AutoCloseable {
     private record Event(Instant timestamp, UUID jobId, String event, String message, String producerThread) { }
     private record Entry(Instant timestamp, UUID jobId, String event, String message,
                          String producerThread, String writerThread, boolean daemon) { }
-    private static final Event STOP = new Event(null, null, null, null, null);
     private final BlockingQueue<Event> queue;
-    private final Object lifecycle = new Object();
+    private final ReentrantLock lifecycle = new ReentrantLock();
+    private final Condition available = lifecycle.newCondition();
+    private final Condition spaceAvailable = lifecycle.newCondition();
     private final Path file;
     private final ObjectMapper mapper;
     private boolean accepting;
@@ -39,7 +42,8 @@ public class AsyncFileLogger implements AutoCloseable {
 
     @PostConstruct
     public void start() throws IOException {
-        synchronized (lifecycle) {
+        lifecycle.lock();
+        try {
             if (writerThread != null) throw new IllegalStateException("Логгер уже запускался");
             Files.createDirectories(file.getParent());
             BufferedWriter output = Files.newBufferedWriter(file, StandardCharsets.UTF_8,
@@ -49,23 +53,32 @@ public class AsyncFileLogger implements AutoCloseable {
             writerThread.setDaemon(true);
             accepting = true;
             writerThread.start();
-        }
+        } finally { lifecycle.unlock(); }
         log.info("Запущен daemon-поток crawler-log-writer, журнал: {}", file);
     }
 
     public boolean publish(UUID jobId, String event, String message) {
-        synchronized (lifecycle) {
-            if (!accepting) return false;
+        Event entry = new Event(Instant.now(), jobId, event, message, Thread.currentThread().getName());
+        try {
+            lifecycle.lockInterruptibly();
             try {
-                // Bounded queue provides backpressure instead of silently dropping events.
-                queue.put(new Event(Instant.now(), jobId, event, message, Thread.currentThread().getName()));
-                return true;
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                log.warn("Постановка события {} в очередь прервана, задание {}", event, jobId);
-                return false;
-            }
+                long remaining = TimeUnit.SECONDS.toNanos(1);
+                while (accepting) {
+                    if (queue.offer(entry)) {
+                        available.signal();
+                        return true;
+                    }
+                    if (remaining <= 0) break;
+                    // awaitNanos releases the lifecycle lock while the queue is full.
+                    remaining = spaceAvailable.awaitNanos(remaining);
+                }
+            } finally { lifecycle.unlock(); }
+            log.warn("Событие не принято журналом (остановка или очередь занята): {} {} {}", jobId, event, message);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Постановка события {} в очередь прервана, задание {}", event, jobId);
         }
+        return false;
     }
 
     @Override
@@ -74,18 +87,14 @@ public class AsyncFileLogger implements AutoCloseable {
         boolean interrupted = Thread.interrupted();
         try {
             Thread thread;
-            synchronized (lifecycle) {
+            lifecycle.lock();
+            try {
                 thread = writerThread;
                 if (thread == null) return;
-                if (accepting) {
-                    accepting = false;
-                    // STOP follows all accepted events, so normal shutdown drains the queue.
-                    while (true) {
-                        try { queue.put(STOP); break; }
-                        catch (InterruptedException e) { interrupted = true; }
-                    }
-                }
-            }
+                accepting = false;
+                available.signalAll();
+                spaceAvailable.signalAll();
+            } finally { lifecycle.unlock(); }
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
             while (thread.isAlive()) {
                 long remaining = deadline - System.nanoTime();
@@ -101,6 +110,16 @@ public class AsyncFileLogger implements AutoCloseable {
         }
     }
 
+    private Event nextEvent() throws InterruptedException {
+        lifecycle.lockInterruptibly();
+        try {
+            while (queue.isEmpty() && accepting) available.await();
+            Event event = queue.poll();
+            if (event != null) spaceAvailable.signalAll();
+            return event; // null means closed and drained; no blocking poison-pill insertion.
+        } finally { lifecycle.unlock(); }
+    }
+
     private final class LogWriter implements Runnable {
         private final BufferedWriter output;
         private LogWriter(BufferedWriter output) { this.output = output; }
@@ -109,24 +128,30 @@ public class AsyncFileLogger implements AutoCloseable {
         public void run() {
             try (output) {
                 while (true) {
-                    Event event = queue.take();
-                    if (event == STOP) break;
+                    Event event = nextEvent();
+                    if (event == null) break;
                     Thread thread = Thread.currentThread();
                     Entry entry = new Entry(event.timestamp, event.jobId, event.event, event.message,
                             event.producerThread, thread.getName(), thread.isDaemon());
-                    try {
-                        output.write(mapper.writeValueAsString(entry));
-                        output.newLine();
-                        output.flush();
-                    } catch (IOException e) {
-                        log.error("Не удалось записать событие {} задания {}", event.event, event.jobId, e);
-                    }
+                    // File I/O never holds the lifecycle lock.
+                    output.write(mapper.writeValueAsString(entry));
+                    output.newLine();
+                    output.flush();
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 log.error("Поток записи журнала прерван", e);
-            } catch (IOException e) {
-                log.error("Не удалось закрыть журнал {}", file, e);
+            } catch (IOException | RuntimeException e) {
+                log.error("Поток журнала {} завершился с ошибкой", file, e);
+            } finally {
+                // Also runs for an uncaught Error: producers must never await a dead writer.
+                lifecycle.lock();
+                try {
+                    accepting = false;
+                    available.signalAll();
+                    spaceAvailable.signalAll();
+                } finally { lifecycle.unlock(); }
+                if (!queue.isEmpty()) log.error("В журнал {} не записано {} событий", file, queue.size());
             }
         }
     }

@@ -17,13 +17,12 @@ public class PageFetcher {
     public static final String AGENT = "ContactCrawler";
     public record Fetched(String url, String html) { }
     private record Response(int status, String location, String contentType, String body) { }
-    private static class HostGate { long nextRequest; }
     private final WebClient client;
     private final Duration timeout;
     private final long delayMillis;
-    private final ConcurrentMap<String, HostGate> gates = new ConcurrentHashMap<>();
+    private final HostRateLimiter rateLimiter;
 
-    public PageFetcher(WebClient.Builder builder,
+    public PageFetcher(WebClient.Builder builder, HostRateLimiter rateLimiter,
                        @Value("${crawler.request-timeout-seconds}") int seconds,
                        @Value("${crawler.max-body-bytes}") int maxBytes,
                        @Value("${crawler.host-delay-millis}") long delayMillis) {
@@ -31,6 +30,7 @@ public class PageFetcher {
                 .defaultHeader("User-Agent", AGENT + "/1.0")
                 .codecs(codecs -> codecs.defaultCodecs().maxInMemorySize(maxBytes)).build();
         timeout = Duration.ofSeconds(seconds); this.delayMillis = delayMillis;
+        this.rateLimiter = rateLimiter;
     }
 
     public Fetched fetch(String initialUrl, Set<String> origins, ConcurrentMap<String, BaseRobotRules> robots) {
@@ -68,15 +68,7 @@ public class PageFetcher {
     }
 
     private Response request(String url, long delay) {
-        HostGate gate = gates.computeIfAbsent(Urls.origin(url), ignored -> new HostGate());
-        synchronized (gate) {
-            long wait = gate.nextRequest - System.nanoTime();
-            if (wait > 0) {
-                try { TimeUnit.NANOSECONDS.sleep(wait); }
-                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IllegalStateException("Загрузка прервана", e); }
-            }
-            gate.nextRequest = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delay);
-        }
+        rateLimiter.awaitSlot(Urls.origin(url), delay);
         Response response = client.get().uri(URI.create(url)).exchangeToMono(result -> {
             int status = result.statusCode().value();
             String location = result.headers().asHttpHeaders().getFirst("Location");

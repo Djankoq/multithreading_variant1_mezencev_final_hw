@@ -23,7 +23,7 @@ import static org.assertj.core.api.Assertions.*;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "spring.datasource.url=jdbc:h2:mem:crawler-tests;DB_CLOSE_DELAY=-1", "spring.jpa.hibernate.ddl-auto=create-drop",
         "crawler.host-delay-millis=0", "crawler.workers=4", "crawler.scheduler-delay-millis=100",
-        "crawler.request-timeout-seconds=2", "crawler.max-body-bytes=65536"})
+        "crawler.request-timeout-seconds=5", "crawler.max-body-bytes=65536"})
 class CrawlerIntegrationTest {
     private static final Path artifacts = Path.of("target", "test-artifacts", UUID.randomUUID().toString()).toAbsolutePath();
 
@@ -43,6 +43,11 @@ class CrawlerIntegrationTest {
     private final AtomicInteger forbiddenVisits = new AtomicInteger();
     private final CountDownLatch slowArrivals = new CountDownLatch(2);
     private final CountDownLatch releaseSlow = new CountDownLatch(1);
+    private final CountDownLatch pipelineSlowEntered = new CountDownLatch(1);
+    private final CountDownLatch pipelineChildVisited = new CountDownLatch(1);
+    private final CountDownLatch releasePipelineSlow = new CountDownLatch(1);
+    private final CountDownLatch releaseRouteSlow = new CountDownLatch(1);
+    private final AtomicInteger sharedVisits = new AtomicInteger();
 
     @BeforeEach
     void serveFixture() throws Exception {
@@ -73,6 +78,25 @@ class CrawlerIntegrationTest {
                     catch (InterruptedException e) { Thread.currentThread().interrupt(); }
                     body = "<p>slow@fixture.example</p>";
                 }
+                case "/pipeline" -> body = "<a href='/pipeline-slow'>Slow first</a><a href='/pipeline-fast'>Fast</a>";
+                case "/pipeline-slow" -> {
+                    pipelineSlowEntered.countDown(); waitForRelease(releasePipelineSlow);
+                    body = "slow@pipeline.example";
+                }
+                case "/pipeline-fast" -> body = "fast@pipeline.example <a href='/pipeline-child'>Child</a>";
+                case "/pipeline-child" -> {
+                    pipelineChildVisited.countDown(); body = "child@pipeline.example";
+                }
+                case "/routes" -> body = "<a href='/route-slow'>Short slow route</a><a href='/route-fast'>Long fast route</a>";
+                case "/route-slow" -> {
+                    waitForRelease(releaseRouteSlow); body = "<a href='/shared'>Shared</a>";
+                }
+                case "/route-fast" -> body = "<a href='/middle'>Middle</a>";
+                case "/middle" -> body = "<a href='/shared'>Shared</a>";
+                case "/shared" -> {
+                    sharedVisits.incrementAndGet(); body = "shared@routes.example <a href='/leaf'>Leaf</a>";
+                }
+                case "/leaf" -> body = "leaf@routes.example";
                 default -> { status = 404; body = "Not found"; }
             }
             exchange.getResponseHeaders().set("Content-Type", path.equals("/robots.txt") ? "text/plain; charset=UTF-8" : "text/html; charset=UTF-8");
@@ -86,6 +110,7 @@ class CrawlerIntegrationTest {
 
     @AfterEach
     void stopFixture() {
+        releaseSlow.countDown(); releasePipelineSlow.countDown(); releaseRouteSlow.countDown();
         schedules.deleteAll(); server.stop(0); serverExecutor.shutdownNow();
     }
 
@@ -108,6 +133,42 @@ class CrawlerIntegrationTest {
     void respectsDepthAndPageLimits() throws Exception {
         assertThat(await(start(origin + "/", 0, 10)).path("processedPages").asInt()).isEqualTo(1);
         assertThat(await(start(origin + "/", 5, 2)).path("processedPages").asInt()).isEqualTo(2);
+    }
+
+    @Test
+    void savesFastPagesAndStartsTheirChildrenWhileEarlierPageIsStillBlocked() throws Exception {
+        UUID id = start(origin + "/pipeline", 2, 10);
+        try {
+            assertThat(pipelineSlowEntered.await(1, TimeUnit.SECONDS)).isTrue();
+            assertThat(pipelineChildVisited.await(2, TimeUnit.SECONDS)).isTrue();
+            awaitContact(id, "child@pipeline.example");
+            assertThat(http.getForObject("/api/crawls/" + id, JsonNode.class).path("status").asText()).isEqualTo("RUNNING");
+        } finally {
+            releasePipelineSlow.countDown(); await(id);
+        }
+        JsonNode job = http.getForObject("/api/crawls/" + id, JsonNode.class);
+        assertThat(job.path("status").asText()).isEqualTo("COMPLETED");
+        assertThat(job.path("processedPages").asInt()).isEqualTo(4);
+    }
+
+    @Test
+    void shorterLateRouteReusesLoadedLinksAndPreservesDepthLimitWithoutRefetching() throws Exception {
+        UUID id = start(origin + "/routes", 3, 10);
+        try {
+            awaitContact(id, "shared@routes.example");
+            JsonNode before = http.getForObject("/api/crawls/" + id + "/pages", JsonNode.class);
+            assertThat(pageDepth(before, "/shared")).isEqualTo(3);
+        } finally {
+            releaseRouteSlow.countDown(); await(id);
+        }
+        JsonNode job = http.getForObject("/api/crawls/" + id, JsonNode.class);
+        assertThat(job.path("status").asText()).isEqualTo("COMPLETED");
+        assertThat(job.path("processedPages").asInt()).isEqualTo(6);
+        JsonNode after = http.getForObject("/api/crawls/" + id + "/pages", JsonNode.class);
+        assertThat(pageDepth(after, "/shared")).isEqualTo(2);
+        assertThat(pageDepth(after, "/leaf")).isEqualTo(3);
+        assertThat(sharedVisits.get()).isEqualTo(1);
+        awaitContact(id, "leaf@routes.example");
     }
 
     @Test
@@ -218,6 +279,23 @@ class CrawlerIntegrationTest {
         ResponseEntity<JsonNode> response = http.postForEntity("/api/crawls", Map.of("startUrls", List.of(url), "maxDepth", depth, "maxPages", pages), JsonNode.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
         return UUID.fromString(response.getBody().path("id").asText());
+    }
+    private void waitForRelease(CountDownLatch release) {
+        try { release.await(10, TimeUnit.SECONDS); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+    private int pageDepth(JsonNode pages, String suffix) {
+        for (JsonNode page : pages) if (page.path("url").asText().endsWith(suffix)) return page.path("depth").asInt();
+        throw new AssertionError("Страница не найдена: " + suffix);
+    }
+    private void awaitContact(UUID id, String value) throws Exception {
+        Instant deadline = Instant.now().plusSeconds(2);
+        while (Instant.now().isBefore(deadline)) {
+            JsonNode result = http.getForObject("/answer?jobId=" + id + "&query=" + value, JsonNode.class);
+            if (result.path("total").asInt() > 0) return;
+            Thread.sleep(25);
+        }
+        throw new AssertionError("Контакт не появился до завершения медленной страницы: " + value);
     }
     private JsonNode await(UUID id) throws Exception {
         Instant deadline = Instant.now().plusSeconds(10);
